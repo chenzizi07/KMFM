@@ -10,7 +10,26 @@ import pandas as pd
 from scipy import stats
 
 
-METRICS = ("oa", "aa", "kappa")
+PRIMARY_METRICS = ("oa", "aa", "kappa")
+PROBABILISTIC_METRICS = ("nll", "brier", "ece")
+DIAGNOSTIC_FIELDS = (
+    "spatial_branch_oa",
+    "spectral_branch_oa",
+    "spatial_branch_nll",
+    "spectral_branch_nll",
+    "oracle_oa",
+    "oracle_gap",
+    "oracle_gap_recovery",
+    "discordant_count",
+    "discordant_fraction",
+    "routing_auc",
+    "contribution_ratio_mean",
+    "contribution_ratio_std",
+    "gate_entropy_gap_spearman",
+    "spatial_temperature",
+    "spectral_temperature",
+)
+PAIRED_METRICS = PRIMARY_METRICS + PROBABILISTIC_METRICS
 
 
 def _load_runs(root: Path) -> pd.DataFrame:
@@ -39,7 +58,9 @@ def _load_runs(root: Path) -> pd.DataFrame:
             "gate_mean": metrics.get("gate_mean"),
             "gate_std": metrics.get("gate_std"),
         }
-        row.update({metric: metrics[metric] for metric in METRICS})
+        row.update({metric: metrics[metric] for metric in PRIMARY_METRICS})
+        for field in PROBABILISTIC_METRICS + DIAGNOSTIC_FIELDS:
+            row[field] = metrics.get(field)
         rows.append(row)
     if not rows:
         raise ValueError(f"No successful metrics.json files found under {root}")
@@ -64,8 +85,12 @@ def _summary(frame: pd.DataFrame) -> pd.DataFrame:
             "model": keys[2],
             "n": len(group),
         }
-        for metric in METRICS:
-            values = group[metric].to_numpy(dtype=float)
+        for metric in PRIMARY_METRICS + PROBABILISTIC_METRICS + DIAGNOSTIC_FIELDS:
+            if metric not in group:
+                continue
+            values = group[metric].dropna().to_numpy(dtype=float)
+            if len(values) == 0:
+                continue
             mean = float(values.mean())
             sd = float(values.std(ddof=1)) if len(values) > 1 else float("nan")
             half = (
@@ -77,10 +102,13 @@ def _summary(frame: pd.DataFrame) -> pd.DataFrame:
             record[f"{metric}_sd"] = sd
             record[f"{metric}_ci95_low"] = mean - half
             record[f"{metric}_ci95_high"] = mean + half
-            record[f"{metric}_mean_percent"] = 100.0 * mean
-            record[f"{metric}_sd_percent"] = 100.0 * sd
-            record[f"{metric}_ci95_low_percent"] = 100.0 * (mean - half)
-            record[f"{metric}_ci95_high_percent"] = 100.0 * (mean + half)
+            if metric in PRIMARY_METRICS:
+                record[f"{metric}_mean_percent"] = 100.0 * mean
+                record[f"{metric}_sd_percent"] = 100.0 * sd
+                record[f"{metric}_ci95_low_percent"] = 100.0 * (mean - half)
+                record[f"{metric}_ci95_high_percent"] = 100.0 * (mean + half)
+        record["oa_min"] = float(group["oa"].min())
+        record["oa_max"] = float(group["oa"].max())
         record["parameter_count_mean"] = float(group["parameter_count"].mean())
         record["training_seconds_mean"] = float(group["training_seconds"].mean())
         record["test_inference_seconds_mean"] = float(group["test_inference_seconds"].mean())
@@ -102,55 +130,73 @@ def _holm_adjust(p_values: list[float]) -> list[float]:
     return adjusted.tolist()
 
 
-def _paired_tests(frame: pd.DataFrame, reference_model: str) -> pd.DataFrame:
+def _paired_tests(frame: pd.DataFrame, reference_models: list[str]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for (dataset, protocol), subset in frame.groupby(["dataset", "protocol"], sort=True):
-        reference = subset[subset["model"] == reference_model].set_index("seed")
-        if reference.empty:
-            continue
-        for model in sorted(set(subset["model"]) - {reference_model}):
-            candidate = subset[subset["model"] == model].set_index("seed")
-            common = sorted(set(reference.index) & set(candidate.index))
-            if len(common) < 2:
+        for reference_model in reference_models:
+            reference = subset[subset["model"] == reference_model].set_index("seed")
+            if reference.empty:
                 continue
-            for seed in common:
-                reference_hash = reference.loc[seed, "split_sha256"]
-                candidate_hash = candidate.loc[seed, "split_sha256"]
-                if (
-                    pd.notna(reference_hash)
-                    and pd.notna(candidate_hash)
-                    and reference_hash != candidate_hash
-                ):
-                    raise ValueError(
-                        f"Paired comparison uses different split hashes for "
-                        f"{dataset}/{protocol}/seed {seed}: {reference_model}={reference_hash}, "
-                        f"{model}={candidate_hash}"
+            for model in sorted(set(subset["model"]) - {reference_model}):
+                candidate = subset[subset["model"] == model].set_index("seed")
+                common = sorted(set(reference.index) & set(candidate.index))
+                if len(common) < 2:
+                    continue
+                for seed in common:
+                    reference_hash = reference.loc[seed, "split_sha256"]
+                    candidate_hash = candidate.loc[seed, "split_sha256"]
+                    if (
+                        pd.notna(reference_hash)
+                        and pd.notna(candidate_hash)
+                        and reference_hash != candidate_hash
+                    ):
+                        raise ValueError(
+                            f"Paired comparison uses different split hashes for "
+                            f"{dataset}/{protocol}/seed {seed}: {reference_model}={reference_hash}, "
+                            f"{model}={candidate_hash}"
+                        )
+                for metric in PAIRED_METRICS:
+                    paired = pd.concat(
+                        [candidate.loc[common, metric], reference.loc[common, metric]],
+                        axis=1,
+                    ).dropna()
+                    if len(paired) < 2:
+                        continue
+                    x = paired.iloc[:, 0].to_numpy(dtype=float)
+                    y = paired.iloc[:, 1].to_numpy(dtype=float)
+                    difference = x - y
+                    t_p = float(stats.ttest_rel(x, y).pvalue)
+                    try:
+                        w_p = (
+                            float(stats.wilcoxon(difference).pvalue)
+                            if np.any(difference != 0)
+                            else 1.0
+                        )
+                    except ValueError:
+                        w_p = float("nan")
+                    difference_sd = difference.std(ddof=1)
+                    dz = float(difference.mean() / difference_sd) if difference_sd > 0 else 0.0
+                    records.append(
+                        {
+                            "dataset": dataset,
+                            "protocol": protocol,
+                            "model": model,
+                            "reference": reference_model,
+                            "metric": metric,
+                            "n_pairs": len(paired),
+                            "mean_difference": float(difference.mean()),
+                            "mean_difference_percentage_points": (
+                                float(100.0 * difference.mean())
+                                if metric in PRIMARY_METRICS
+                                else None
+                            ),
+                            "positive_pairs": int(np.sum(difference > 0)),
+                            "negative_pairs": int(np.sum(difference < 0)),
+                            "paired_t_p": t_p,
+                            "wilcoxon_p": w_p,
+                            "cohen_dz": dz,
+                        }
                     )
-            for metric in METRICS:
-                x = candidate.loc[common, metric].to_numpy(dtype=float)
-                y = reference.loc[common, metric].to_numpy(dtype=float)
-                difference = x - y
-                t_p = float(stats.ttest_rel(x, y).pvalue)
-                try:
-                    w_p = float(stats.wilcoxon(difference).pvalue) if np.any(difference != 0) else 1.0
-                except ValueError:
-                    w_p = float("nan")
-                dz = float(difference.mean() / difference.std(ddof=1)) if difference.std(ddof=1) > 0 else 0.0
-                records.append(
-                    {
-                        "dataset": dataset,
-                        "protocol": protocol,
-                        "model": model,
-                        "reference": reference_model,
-                        "metric": metric,
-                        "n_pairs": len(common),
-                        "mean_difference": float(difference.mean()),
-                        "mean_difference_percentage_points": float(100.0 * difference.mean()),
-                        "paired_t_p": t_p,
-                        "wilcoxon_p": w_p,
-                        "cohen_dz": dz,
-                    }
-                )
     if not records:
         return pd.DataFrame()
     tests = pd.DataFrame(records)
@@ -173,7 +219,10 @@ def main() -> None:
     runs.to_csv(output / "per_run.csv", index=False)
     summary.to_csv(output / "summary.csv", index=False)
     if args.reference_model:
-        tests = _paired_tests(runs, args.reference_model)
+        reference_models = [
+            value.strip() for value in args.reference_model.split(",") if value.strip()
+        ]
+        tests = _paired_tests(runs, reference_models)
         tests.to_csv(output / "paired_tests.csv", index=False)
     print(summary.to_string(index=False))
 

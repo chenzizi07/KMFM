@@ -179,7 +179,13 @@ def normalized_entropy(logits: torch.Tensor) -> torch.Tensor:
 
 
 class FusionModule(nn.Module):
-    def __init__(self, hidden_dim: int, mode: str = "reliability", dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        mode: str = "reliability",
+        dropout: float = 0.1,
+        entropy_temperature: float = 0.25,
+    ) -> None:
         super().__init__()
         supported = {
             "spatial_only",
@@ -189,10 +195,14 @@ class FusionModule(nn.Module):
             "global",
             "gate",
             "reliability",
+            "entropy_softmax",
         }
         if mode not in supported:
             raise ValueError(f"Unsupported fusion {mode!r}; choose from {sorted(supported)}")
+        if entropy_temperature <= 0:
+            raise ValueError("entropy_temperature must be positive")
         self.mode = mode
+        self.entropy_temperature = float(entropy_temperature)
         if mode == "concat":
             self.project = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Dropout(dropout)
@@ -231,6 +241,15 @@ class FusionModule(nn.Module):
             weights = torch.softmax(self.global_logits, dim=0)
             gate = weights[0].expand(spatial.shape[0], 1)
             return weights[0] * spatial + weights[1] * spectral, gate
+        if self.mode == "entropy_softmax":
+            # Reliability is deliberately non-trainable at sample level. Detaching
+            # prevents the fused loss from changing logit scale merely to route a sample.
+            uncertainty = torch.cat(
+                [spatial_entropy.detach(), spectral_entropy.detach()], dim=-1
+            )
+            weights = torch.softmax(-uncertainty / self.entropy_temperature, dim=-1)
+            gate = weights[:, :1]
+            return gate * spatial + weights[:, 1:] * spectral, gate
 
         parts = [spatial, spectral, torch.abs(spatial - spectral)]
         if self.mode == "reliability":
@@ -256,8 +275,11 @@ class LASSFNet(nn.Module):
             "global",
             "gate",
             "reliability",
+            "entropy_softmax",
         ] = "reliability",
         dropout: float = 0.1,
+        normalize_branches: bool = False,
+        entropy_temperature: float = 0.25,
     ) -> None:
         super().__init__()
         if spectral == "conv1d":
@@ -267,22 +289,60 @@ class LASSFNet(nn.Module):
         else:
             raise ValueError("spectral must be 'conv1d' or 'mlp'")
         self.spatial_encoder = MultiDirectionSpatialSSM(bands=bands, hidden_dim=hidden_dim, dropout=dropout)
+        self.normalize_branches = bool(normalize_branches)
+        if self.normalize_branches:
+            self.spatial_adapter: nn.Module = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+            )
+            self.spectral_adapter: nn.Module = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+            )
+        else:
+            self.spatial_adapter = nn.Identity()
+            self.spectral_adapter = nn.Identity()
         self.spatial_head = nn.Linear(hidden_dim, num_classes)
         self.spectral_head = nn.Linear(hidden_dim, num_classes)
-        self.fusion = FusionModule(hidden_dim=hidden_dim, mode=fusion, dropout=dropout)
+        self.fusion = FusionModule(
+            hidden_dim=hidden_dim,
+            mode=fusion,
+            dropout=dropout,
+            entropy_temperature=entropy_temperature,
+        )
         self.classifier = nn.Linear(hidden_dim, num_classes)
         self.num_classes = int(num_classes)
+        self.register_buffer("spatial_logit_temperature", torch.tensor(1.0))
+        self.register_buffer("spectral_logit_temperature", torch.tensor(1.0))
+
+    def set_branch_temperatures(self, spatial: float, spectral: float) -> None:
+        if spatial <= 0 or spectral <= 0:
+            raise ValueError("Branch temperatures must be positive")
+        self.spatial_logit_temperature.fill_(float(spatial))
+        self.spectral_logit_temperature.fill_(float(spectral))
 
     def forward(
         self, patch: torch.Tensor, context_mask: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
         center = patch[:, :, patch.shape[-2] // 2, patch.shape[-1] // 2]
-        spectral_feature = self.spectral_encoder(center)
-        spatial_feature = self.spatial_encoder(patch, context_mask=context_mask)
+        spectral_feature = self.spectral_adapter(self.spectral_encoder(center))
+        spatial_feature = self.spatial_adapter(
+            self.spatial_encoder(patch, context_mask=context_mask)
+        )
         spectral_logits = self.spectral_head(spectral_feature)
         spatial_logits = self.spatial_head(spatial_feature)
-        spectral_entropy = normalized_entropy(spectral_logits)
-        spatial_entropy = normalized_entropy(spatial_logits)
+        spectral_calibrated_logits = (
+            spectral_logits / self.spectral_logit_temperature.clamp_min(1e-4)
+        )
+        spatial_calibrated_logits = (
+            spatial_logits / self.spatial_logit_temperature.clamp_min(1e-4)
+        )
+        spectral_entropy = normalized_entropy(spectral_calibrated_logits)
+        spatial_entropy = normalized_entropy(spatial_calibrated_logits)
         fused_feature, gate = self.fusion(
             spatial_feature,
             spectral_feature,
@@ -290,13 +350,35 @@ class LASSFNet(nn.Module):
             spectral_entropy,
         )
         logits = self.classifier(fused_feature)
+        finite_gate = torch.isfinite(gate)
+        spatial_feature_norm = torch.linalg.vector_norm(spatial_feature, dim=-1, keepdim=True)
+        spectral_feature_norm = torch.linalg.vector_norm(spectral_feature, dim=-1, keepdim=True)
+        spatial_contribution_norm = torch.where(
+            finite_gate,
+            torch.linalg.vector_norm(gate * spatial_feature, dim=-1, keepdim=True),
+            torch.full_like(gate, float("nan")),
+        )
+        spectral_contribution_norm = torch.where(
+            finite_gate,
+            torch.linalg.vector_norm((1.0 - gate) * spectral_feature, dim=-1, keepdim=True),
+            torch.full_like(gate, float("nan")),
+        )
+        contribution_total = spatial_contribution_norm + spectral_contribution_norm
+        contribution_ratio = spatial_contribution_norm / contribution_total.clamp_min(1e-8)
         return {
             "logits": logits,
             "spatial_logits": spatial_logits,
             "spectral_logits": spectral_logits,
+            "spatial_calibrated_logits": spatial_calibrated_logits,
+            "spectral_calibrated_logits": spectral_calibrated_logits,
             "gate": gate,
             "spatial_entropy": spatial_entropy,
             "spectral_entropy": spectral_entropy,
             "spatial_feature": spatial_feature,
             "spectral_feature": spectral_feature,
+            "spatial_feature_norm": spatial_feature_norm,
+            "spectral_feature_norm": spectral_feature_norm,
+            "spatial_contribution_norm": spatial_contribution_norm,
+            "spectral_contribution_norm": spectral_contribution_norm,
+            "contribution_ratio": contribution_ratio,
         }

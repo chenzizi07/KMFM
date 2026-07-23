@@ -11,12 +11,14 @@ from typing import Any
 
 import numpy as np
 import torch
+from scipy import stats
+from scipy.ndimage import distance_transform_edt
 from torch import nn
 from torch.utils.data import DataLoader
 
 from .artifacts import build_manifest, environment_snapshot, json_dump, save_confusion_csv
 from .data import HSIPatchDataset, load_hsi, standardize_cube
-from .metrics import classification_metrics
+from .metrics import classification_metrics, probabilistic_metrics, routing_diagnostics
 from .model import LASSFNet
 from .splits import TEST, TRAIN, VAL, load_split
 
@@ -38,6 +40,44 @@ def set_reproducibility(seed: int, deterministic: bool = True) -> None:
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _fit_temperature(logits: np.ndarray, targets: np.ndarray) -> float:
+    logits_tensor = torch.as_tensor(logits, dtype=torch.float64)
+    targets_tensor = torch.as_tensor(targets, dtype=torch.long)
+    log_temperature = nn.Parameter(torch.zeros((), dtype=torch.float64))
+    optimizer = torch.optim.LBFGS(
+        [log_temperature], lr=0.1, max_iter=50, line_search_fn="strong_wolfe"
+    )
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        temperature = log_temperature.exp().clamp(0.05, 20.0)
+        loss = nn.functional.cross_entropy(logits_tensor / temperature, targets_tensor)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return float(log_temperature.detach().exp().clamp(0.05, 20.0))
+
+
+def _finite_summary(values: np.ndarray) -> tuple[float | None, float | None]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None, None
+    return float(finite.mean()), float(finite.std())
+
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> float | None:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 3 or np.unique(x[finite]).size < 2 or np.unique(y[finite]).size < 2:
+        return None
+    result = stats.spearmanr(x[finite], y[finite])
+    correlation = float(result.statistic)
+    return correlation if np.isfinite(correlation) else None
 
 
 def _model_name(config: dict[str, Any]) -> str:
@@ -117,6 +157,16 @@ def _run_loader(
     gates_all: list[np.ndarray] = []
     spatial_entropy_all: list[np.ndarray] = []
     spectral_entropy_all: list[np.ndarray] = []
+    logits_all: list[np.ndarray] = []
+    spatial_logits_all: list[np.ndarray] = []
+    spectral_logits_all: list[np.ndarray] = []
+    spatial_calibrated_logits_all: list[np.ndarray] = []
+    spectral_calibrated_logits_all: list[np.ndarray] = []
+    spatial_feature_norm_all: list[np.ndarray] = []
+    spectral_feature_norm_all: list[np.ndarray] = []
+    spatial_contribution_norm_all: list[np.ndarray] = []
+    spectral_contribution_norm_all: list[np.ndarray] = []
+    contribution_ratio_all: list[np.ndarray] = []
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
@@ -152,20 +202,82 @@ def _run_loader(
             gates_all.append(output["gate"].detach().float().cpu().numpy())
             spatial_entropy_all.append(output["spatial_entropy"].detach().float().cpu().numpy())
             spectral_entropy_all.append(output["spectral_entropy"].detach().float().cpu().numpy())
+            logits_all.append(output["logits"].detach().float().cpu().numpy())
+            spatial_logits_all.append(output["spatial_logits"].detach().float().cpu().numpy())
+            spectral_logits_all.append(output["spectral_logits"].detach().float().cpu().numpy())
+            spatial_calibrated_logits_all.append(
+                output["spatial_calibrated_logits"].detach().float().cpu().numpy()
+            )
+            spectral_calibrated_logits_all.append(
+                output["spectral_calibrated_logits"].detach().float().cpu().numpy()
+            )
+            spatial_feature_norm_all.append(
+                output["spatial_feature_norm"].detach().float().cpu().numpy()
+            )
+            spectral_feature_norm_all.append(
+                output["spectral_feature_norm"].detach().float().cpu().numpy()
+            )
+            spatial_contribution_norm_all.append(
+                output["spatial_contribution_norm"].detach().float().cpu().numpy()
+            )
+            spectral_contribution_norm_all.append(
+                output["spectral_contribution_norm"].detach().float().cpu().numpy()
+            )
+            contribution_ratio_all.append(
+                output["contribution_ratio"].detach().float().cpu().numpy()
+            )
 
     targets = np.concatenate(targets_all)
     predictions = np.concatenate(predictions_all)
+    logits = np.concatenate(logits_all)
+    spatial_logits = np.concatenate(spatial_logits_all)
+    spectral_logits = np.concatenate(spectral_logits_all)
+    spatial_calibrated_logits = np.concatenate(spatial_calibrated_logits_all)
+    spectral_calibrated_logits = np.concatenate(spectral_calibrated_logits_all)
+    gate = np.concatenate(gates_all)
+    spatial_predictions = spatial_logits.argmax(axis=-1)
+    spectral_predictions = spectral_logits.argmax(axis=-1)
     metrics, confusion = classification_metrics(targets, predictions, num_classes)
+    metrics.update(probabilistic_metrics(targets, logits))
+    metrics.update(
+        routing_diagnostics(
+            targets,
+            predictions,
+            spatial_predictions,
+            spectral_predictions,
+            gate,
+        )
+    )
+    spatial_probability_metrics = probabilistic_metrics(targets, spatial_calibrated_logits)
+    spectral_probability_metrics = probabilistic_metrics(targets, spectral_calibrated_logits)
+    metrics.update(
+        {f"spatial_branch_{name}": value for name, value in spatial_probability_metrics.items()}
+    )
+    metrics.update(
+        {f"spectral_branch_{name}": value for name, value in spectral_probability_metrics.items()}
+    )
     return {
         "loss": float(np.mean(losses)),
         "metrics": metrics,
         "confusion": confusion,
         "targets": targets,
         "predictions": predictions,
+        "logits": logits,
+        "spatial_predictions": spatial_predictions,
+        "spectral_predictions": spectral_predictions,
+        "spatial_logits": spatial_logits,
+        "spectral_logits": spectral_logits,
+        "spatial_calibrated_logits": spatial_calibrated_logits,
+        "spectral_calibrated_logits": spectral_calibrated_logits,
         "coords": np.concatenate(coords_all),
-        "gate": np.concatenate(gates_all),
+        "gate": gate,
         "spatial_entropy": np.concatenate(spatial_entropy_all),
         "spectral_entropy": np.concatenate(spectral_entropy_all),
+        "spatial_feature_norm": np.concatenate(spatial_feature_norm_all),
+        "spectral_feature_norm": np.concatenate(spectral_feature_norm_all),
+        "spatial_contribution_norm": np.concatenate(spatial_contribution_norm_all),
+        "spectral_contribution_norm": np.concatenate(spectral_contribution_norm_all),
+        "contribution_ratio": np.concatenate(contribution_ratio_all),
     }
 
 
@@ -247,6 +359,8 @@ def run_experiment(config: dict[str, Any]) -> Path:
             spectral=model_cfg.get("spectral", "conv1d"),
             fusion=model_cfg.get("fusion", "reliability"),
             dropout=float(model_cfg.get("dropout", 0.1)),
+            normalize_branches=bool(model_cfg.get("normalize_branches", False)),
+            entropy_temperature=float(model_cfg.get("entropy_temperature", 0.25)),
         ).to(device)
         parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
         criterion = nn.CrossEntropyLoss()
@@ -343,6 +457,57 @@ def run_experiment(config: dict[str, Any]) -> Path:
             checkpoint = torch.load(run_dir / "checkpoint_best.pt", map_location=device)
         model.load_state_dict(checkpoint["model_state"])
         model.eval()
+
+        calibration = {
+            "enabled": False,
+            "spatial_temperature": 1.0,
+            "spectral_temperature": 1.0,
+        }
+        if bool(model_cfg.get("calibrate_branch_temperatures", False)):
+            validation_before = _run_loader(
+                model,
+                val_loader,
+                device,
+                hsi.num_classes,
+                criterion,
+                None,
+                None,
+                aux_weight,
+                amp_enabled,
+            )
+            spatial_temperature = _fit_temperature(
+                validation_before["spatial_logits"], validation_before["targets"]
+            )
+            spectral_temperature = _fit_temperature(
+                validation_before["spectral_logits"], validation_before["targets"]
+            )
+            model.set_branch_temperatures(spatial_temperature, spectral_temperature)
+            validation_after = _run_loader(
+                model,
+                val_loader,
+                device,
+                hsi.num_classes,
+                criterion,
+                None,
+                None,
+                aux_weight,
+                amp_enabled,
+            )
+            calibration = {
+                "enabled": True,
+                "spatial_temperature": spatial_temperature,
+                "spectral_temperature": spectral_temperature,
+                "spatial_nll_before": validation_before["metrics"]["spatial_branch_nll"],
+                "spatial_nll_after": validation_after["metrics"]["spatial_branch_nll"],
+                "spectral_nll_before": validation_before["metrics"]["spectral_branch_nll"],
+                "spectral_nll_after": validation_after["metrics"]["spectral_branch_nll"],
+                "fused_oa_before": validation_before["metrics"]["oa"],
+                "fused_oa_after": validation_after["metrics"]["oa"],
+                "fused_nll_before": validation_before["metrics"]["nll"],
+                "fused_nll_after": validation_after["metrics"]["nll"],
+            }
+        json_dump(run_dir / "calibration.json", calibration)
+
         # Warm-up one validation batch before measuring final test inference.
         warm_patch, _, _, warm_mask = next(iter(val_loader))
         with torch.no_grad():
@@ -371,14 +536,76 @@ def run_experiment(config: dict[str, Any]) -> Path:
         np.save(run_dir / "prediction.npy", prediction_map)
         np.save(run_dir / "ground_truth_eval.npy", target_map)
         np.save(run_dir / "confusion_matrix.npy", test_result["confusion"])
+        np.save(run_dir / "test_coords.npy", test_result["coords"].astype(np.int32))
+        np.save(run_dir / "test_targets.npy", test_result["targets"].astype(np.int16))
+        np.save(run_dir / "test_predictions.npy", test_result["predictions"].astype(np.int16))
+        np.save(run_dir / "test_logits.npy", test_result["logits"].astype(np.float32))
+        np.save(
+            run_dir / "spatial_predictions.npy",
+            test_result["spatial_predictions"].astype(np.int16),
+        )
+        np.save(
+            run_dir / "spectral_predictions.npy",
+            test_result["spectral_predictions"].astype(np.int16),
+        )
+        np.save(run_dir / "spatial_logits.npy", test_result["spatial_logits"].astype(np.float32))
+        np.save(run_dir / "spectral_logits.npy", test_result["spectral_logits"].astype(np.float32))
+        np.save(
+            run_dir / "spatial_calibrated_logits.npy",
+            test_result["spatial_calibrated_logits"].astype(np.float32),
+        )
+        np.save(
+            run_dir / "spectral_calibrated_logits.npy",
+            test_result["spectral_calibrated_logits"].astype(np.float32),
+        )
         np.save(run_dir / "gate.npy", test_result["gate"].astype(np.float32))
         np.save(run_dir / "spatial_entropy.npy", test_result["spatial_entropy"].astype(np.float32))
         np.save(run_dir / "spectral_entropy.npy", test_result["spectral_entropy"].astype(np.float32))
+        np.save(
+            run_dir / "spatial_feature_norm.npy",
+            test_result["spatial_feature_norm"].astype(np.float32),
+        )
+        np.save(
+            run_dir / "spectral_feature_norm.npy",
+            test_result["spectral_feature_norm"].astype(np.float32),
+        )
+        np.save(
+            run_dir / "spatial_contribution_norm.npy",
+            test_result["spatial_contribution_norm"].astype(np.float32),
+        )
+        np.save(
+            run_dir / "spectral_contribution_norm.npy",
+            test_result["spectral_contribution_norm"].astype(np.float32),
+        )
+        np.save(
+            run_dir / "contribution_ratio.npy",
+            test_result["contribution_ratio"].astype(np.float32),
+        )
+        if protocol_name == "spatial_block":
+            boundary_distance_map = distance_transform_edt(split.region_map == TEST)
+            boundary_distance = boundary_distance_map[rows, cols]
+        else:
+            boundary_distance = np.full(len(rows), np.nan, dtype=np.float32)
+        np.save(run_dir / "boundary_distance.npy", boundary_distance.astype(np.float32))
         save_confusion_csv(run_dir / "confusion_matrix.csv", test_result["confusion"])
 
-        finite_gate = test_result["gate"][np.isfinite(test_result["gate"])]
-        gate_mean = float(finite_gate.mean()) if finite_gate.size else None
-        gate_std = float(finite_gate.std()) if finite_gate.size else None
+        gate_mean, gate_std = _finite_summary(test_result["gate"])
+        spatial_feature_norm_mean, spatial_feature_norm_std = _finite_summary(
+            test_result["spatial_feature_norm"]
+        )
+        spectral_feature_norm_mean, spectral_feature_norm_std = _finite_summary(
+            test_result["spectral_feature_norm"]
+        )
+        spatial_contribution_norm_mean, spatial_contribution_norm_std = _finite_summary(
+            test_result["spatial_contribution_norm"]
+        )
+        spectral_contribution_norm_mean, spectral_contribution_norm_std = _finite_summary(
+            test_result["spectral_contribution_norm"]
+        )
+        contribution_ratio_mean, contribution_ratio_std = _finite_summary(
+            test_result["contribution_ratio"]
+        )
+        entropy_gap = test_result["spectral_entropy"] - test_result["spatial_entropy"]
         metrics = {
             **test_result["metrics"],
             "test_loss": test_result["loss"],
@@ -390,6 +617,19 @@ def run_experiment(config: dict[str, Any]) -> Path:
             "test_inference_seconds": test_seconds,
             "gate_mean": gate_mean,
             "gate_std": gate_std,
+            "spatial_feature_norm_mean": spatial_feature_norm_mean,
+            "spatial_feature_norm_std": spatial_feature_norm_std,
+            "spectral_feature_norm_mean": spectral_feature_norm_mean,
+            "spectral_feature_norm_std": spectral_feature_norm_std,
+            "spatial_contribution_norm_mean": spatial_contribution_norm_mean,
+            "spatial_contribution_norm_std": spatial_contribution_norm_std,
+            "spectral_contribution_norm_mean": spectral_contribution_norm_mean,
+            "spectral_contribution_norm_std": spectral_contribution_norm_std,
+            "contribution_ratio_mean": contribution_ratio_mean,
+            "contribution_ratio_std": contribution_ratio_std,
+            "gate_entropy_gap_spearman": _spearman(test_result["gate"], entropy_gap),
+            "spatial_temperature": calibration["spatial_temperature"],
+            "spectral_temperature": calibration["spectral_temperature"],
             "seed": seed,
             "dataset": config["data"]["name"],
             "protocol": protocol_name,

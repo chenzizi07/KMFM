@@ -62,6 +62,47 @@ ABLATION_VARIANTS = [
     },
 ]
 
+CALIBRATED_V3_VARIANTS = [
+    {
+        "name": "lassf_mlp_spatial_only_v3_h64",
+        "spectral": "mlp",
+        "fusion": "spatial_only",
+        "normalize_branches": True,
+    },
+    {
+        "name": "lassf_mlp_spectral_only_v3_h64",
+        "spectral": "mlp",
+        "fusion": "spectral_only",
+        "normalize_branches": True,
+    },
+    {
+        "name": "lassf_mlp_concat_norm_v3_h64",
+        "spectral": "mlp",
+        "fusion": "concat",
+        "normalize_branches": True,
+    },
+    {
+        "name": "lassf_mlp_global_norm_v3_h64",
+        "spectral": "mlp",
+        "fusion": "global",
+        "normalize_branches": True,
+    },
+    {
+        "name": "lassf_mlp_gate_norm_v3_h64",
+        "spectral": "mlp",
+        "fusion": "gate",
+        "normalize_branches": True,
+    },
+    {
+        "name": "lassf_mlp_entropy_softmax_v3_h64",
+        "spectral": "mlp",
+        "fusion": "entropy_softmax",
+        "normalize_branches": True,
+        "entropy_temperature": 0.25,
+        "calibrate_branch_temperatures": True,
+    },
+]
+
 
 def _csv_values(raw: str) -> list[str]:
     values = [item.strip() for item in raw.split(",") if item.strip()]
@@ -204,6 +245,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-root", type=Path, default=PROJECT_DEFAULT)
     parser.add_argument("--data-root", type=Path, default=DATA_DEFAULT)
     parser.add_argument("--experiment", default="pilot_v1")
+    parser.add_argument(
+        "--suite",
+        choices=("legacy", "calibrated_v3"),
+        default="legacy",
+        help="Model matrix to run; calibrated_v3 is the six-model mechanism test.",
+    )
     parser.add_argument("--seeds", type=_seeds, default=_seeds("0,1"))
     parser.add_argument(
         "--protocols",
@@ -245,9 +292,12 @@ def main() -> None:
     from kmfm.engine import resolve_run_dir, run_experiment
 
     datasets = list(DATASETS) if args.dataset == "all" else [args.dataset]
-    available_variants = CORE_VARIANTS + (
-        ABLATION_VARIANTS if args.include_ablations else []
-    )
+    if args.suite == "calibrated_v3":
+        available_variants = CALIBRATED_V3_VARIANTS
+    else:
+        available_variants = CORE_VARIANTS + (
+            ABLATION_VARIANTS if args.include_ablations else []
+        )
     variants_by_name = {variant["name"]: variant for variant in available_variants}
     if args.variants:
         unknown = [name for name in args.variants if name not in variants_by_name]
@@ -307,6 +357,12 @@ def main() -> None:
 
     if not args.no_aggregate:
         report_dir = project_root / "reports" / args.experiment
+        if args.suite == "calibrated_v3":
+            reference_models = (
+                "lassf_mlp_spatial_only_v3_h64,lassf_mlp_gate_norm_v3_h64"
+            )
+        else:
+            reference_models = "lassf_conv1d_concat_h64"
         subprocess.run(
             [
                 sys.executable,
@@ -316,11 +372,24 @@ def main() -> None:
                 "--output-dir",
                 str(report_dir),
                 "--reference-model",
-                "lassf_conv1d_concat_h64",
+                reference_models,
             ],
             cwd=project_root,
             check=True,
         )
+        if args.suite == "calibrated_v3":
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(project_root / "scripts" / "evaluate_mechanism.py"),
+                    "--per-run",
+                    str(report_dir / "per_run.csv"),
+                    "--output-dir",
+                    str(report_dir),
+                ],
+                cwd=project_root,
+                check=True,
+            )
         print(f"REPORT {report_dir / 'summary.csv'}")
 
 
