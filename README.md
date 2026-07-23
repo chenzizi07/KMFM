@@ -15,7 +15,7 @@
 ## 1. 目录
 
 ```text
-kmfm_rebuild/
+KMFM/
   configs/                  示例配置
   notebooks/                Colab notebook
   scripts/
