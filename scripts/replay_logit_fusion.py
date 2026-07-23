@@ -239,6 +239,7 @@ def _save_variant(
     policy: ADLFPolicy,
     source_run: Path,
     source_config: dict,
+    extra_arrays: dict[str, np.ndarray] | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     json_dump(run_dir / "status.json", {"state": "running", "seed": metrics["seed"]})
@@ -251,6 +252,10 @@ def _save_variant(
     np.save(run_dir / "test_predictions.npy", np.asarray(predictions, dtype=np.int16))
     np.save(run_dir / "test_logits.npy", np.asarray(logits, dtype=np.float32))
     np.save(run_dir / "spatial_weights.npy", np.asarray(weights, dtype=np.float32))
+    for name, values in (extra_arrays or {}).items():
+        if Path(name).name != name or not name.endswith(".npy"):
+            raise ValueError(f"Invalid extra array name: {name}")
+        np.save(run_dir / name, np.asarray(values))
     np.save(run_dir / "confusion_matrix.npy", confusion)
     save_confusion_csv(run_dir / "confusion_matrix.csv", confusion)
     json_dump(run_dir / "metrics.json", metrics)
