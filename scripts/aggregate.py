@@ -28,6 +28,14 @@ DIAGNOSTIC_FIELDS = (
     "gate_entropy_gap_spearman",
     "spatial_temperature",
     "spectral_temperature",
+    "selected_alpha",
+    "selected_radius",
+    "validation_nll",
+    "prediction_disagreement_count",
+    "prediction_disagreement_fraction",
+    "vs_global_improved_count",
+    "vs_global_harmed_count",
+    "vs_global_net_corrected",
 )
 PAIRED_METRICS = PRIMARY_METRICS + PROBABILISTIC_METRICS
 
