@@ -1,0 +1,13 @@
+.venv-test/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+results/
+reports/
+splits/
+data/*.mat
+data/*.npy
+data/*.npz

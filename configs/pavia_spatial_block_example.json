@@ -1,0 +1,38 @@
+{
+  "seed": 0,
+  "data": {
+    "name": "pavia_university",
+    "data_path": "/content/drive/MyDrive/Colab/Datasets/PaviaU.mat",
+    "gt_path": "/content/drive/MyDrive/Colab/Datasets/PaviaU_gt.mat",
+    "data_key": "paviaU",
+    "gt_key": "paviaU_gt",
+    "zscore_clip": 8.0
+  },
+  "protocol": {
+    "name": "spatial_block",
+    "split_path": "/content/drive/MyDrive/Colab/Unsupervised/KMFM/splits/pavia/spatial_block/seed_0.npz"
+  },
+  "model": {
+    "name": "lassf_conv1d_reliability_h64",
+    "hidden_dim": 64,
+    "spectral": "conv1d",
+    "fusion": "reliability",
+    "dropout": 0.1
+  },
+  "training": {
+    "patch_size": 11,
+    "batch_size": 64,
+    "num_workers": 2,
+    "epochs": 200,
+    "patience": 30,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "aux_weight": 0.2,
+    "amp": true,
+    "deterministic": true
+  },
+  "output": {
+    "root": "/content/drive/MyDrive/Colab/Unsupervised/KMFM/results",
+    "experiment": "pilot_v1"
+  }
+}
