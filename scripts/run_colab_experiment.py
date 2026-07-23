@@ -5,6 +5,7 @@ import copy
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -129,6 +130,35 @@ def _read_status(run_dir: Path) -> str | None:
         return str(json.loads(status_path.read_text(encoding="utf-8")).get("state"))
     except (OSError, json.JSONDecodeError):
         return "invalid"
+
+
+def _archive_incomplete_run(
+    run_dir: Path,
+    *,
+    results_root: Path,
+    experiment: str,
+    status: str | None,
+) -> Path:
+    experiment_root = results_root / experiment
+    try:
+        relative_run = run_dir.relative_to(experiment_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Refusing to archive a run outside the experiment root: {run_dir}"
+        ) from exc
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    state = status or "missing_status"
+    archive_dir = (
+        results_root
+        / "_incomplete"
+        / experiment
+        / relative_run.parent
+        / f"{relative_run.name}__{timestamp}__{state}"
+    )
+    archive_dir.parent.mkdir(parents=True, exist_ok=True)
+    run_dir.rename(archive_dir)
+    return archive_dir
 
 
 def _make_split(
@@ -275,6 +305,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=_csv_values,
         help="Optional comma-separated model names; defaults to all core variants",
     )
+    parser.add_argument(
+        "--recover-incomplete",
+        action="store_true",
+        help=(
+            "Archive each non-successful run under results/_incomplete and rerun it. "
+            "Successful immutable runs are still skipped."
+        ),
+    )
     parser.add_argument("--no-aggregate", action="store_true")
     return parser
 
@@ -348,9 +386,20 @@ def main() -> None:
                         print(f"SKIP successful: {run_dir}")
                         continue
                     if run_dir.exists() and any(run_dir.iterdir()):
-                        raise RuntimeError(
-                            f"Incomplete immutable run exists ({status}): {run_dir}. "
-                            "Inspect status.json, then use a new --experiment name."
+                        if not args.recover_incomplete:
+                            raise RuntimeError(
+                                f"Incomplete immutable run exists ({status}): {run_dir}. "
+                                "Inspect status.json, then use a new --experiment name or "
+                                "explicitly pass --recover-incomplete."
+                            )
+                        archive_dir = _archive_incomplete_run(
+                            run_dir,
+                            results_root=project_root / "results",
+                            experiment=args.experiment,
+                            status=status,
+                        )
+                        print(
+                            f"ARCHIVE incomplete ({status}): {run_dir} -> {archive_dir}"
                         )
                     print(f"RUN {dataset} {protocol} {variant['name']} seed={seed}")
                     run_experiment(config)
