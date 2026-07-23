@@ -104,6 +104,39 @@ CALIBRATED_V3_VARIANTS = [
     },
 ]
 
+OASD_V6_VARIANTS = [
+    {
+        "name": "lassf_mlp_spatial_only_v6_h64",
+        "spectral": "mlp",
+        "fusion": "spatial_only",
+        "normalize_branches": True,
+        "distillation": {"mode": "none", "coefficient": 0.0, "temperature": 2.0},
+    },
+    {
+        "name": "lassf_mlp_uniform_distill_v6_h64",
+        "spectral": "mlp",
+        "fusion": "spatial_only",
+        "normalize_branches": True,
+        "distillation": {"mode": "uniform", "coefficient": 0.5, "temperature": 2.0},
+    },
+    {
+        "name": "lassf_mlp_oof_adv_distill_v6_h64",
+        "spectral": "mlp",
+        "fusion": "spatial_only",
+        "normalize_branches": True,
+        "distillation": {
+            "mode": "oof_class",
+            "coefficient": 0.5,
+            "temperature": 2.0,
+            "folds": 3,
+            "oof_epochs": 60,
+            "oof_aux_weight": 0.5,
+            "prior_strength": 4.0,
+            "reference_gain": 0.25,
+        },
+    },
+]
+
 
 def _csv_values(raw: str) -> list[str]:
     values = [item.strip() for item in raw.split(",") if item.strip()]
@@ -277,9 +310,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment", default="pilot_v1")
     parser.add_argument(
         "--suite",
-        choices=("legacy", "calibrated_v3"),
+        choices=("legacy", "calibrated_v3", "oasd_v6"),
         default="legacy",
-        help="Model matrix to run; calibrated_v3 is the six-model mechanism test.",
+        help=(
+            "Model matrix to run; calibrated_v3 is the six-model mechanism test and "
+            "oasd_v6 is the fixed spatial-only distillation development matrix."
+        ),
     )
     parser.add_argument("--seeds", type=_seeds, default=_seeds("0,1"))
     parser.add_argument(
@@ -332,6 +368,8 @@ def main() -> None:
     datasets = list(DATASETS) if args.dataset == "all" else [args.dataset]
     if args.suite == "calibrated_v3":
         available_variants = CALIBRATED_V3_VARIANTS
+    elif args.suite == "oasd_v6":
+        available_variants = OASD_V6_VARIANTS
     else:
         available_variants = CORE_VARIANTS + (
             ABLATION_VARIANTS if args.include_ablations else []
@@ -410,6 +448,10 @@ def main() -> None:
             reference_models = (
                 "lassf_mlp_spatial_only_v3_h64,lassf_mlp_gate_norm_v3_h64"
             )
+        elif args.suite == "oasd_v6":
+            reference_models = (
+                "lassf_mlp_spatial_only_v6_h64,lassf_mlp_uniform_distill_v6_h64"
+            )
         else:
             reference_models = "lassf_conv1d_concat_h64"
         subprocess.run(
@@ -431,6 +473,19 @@ def main() -> None:
                 [
                     sys.executable,
                     str(project_root / "scripts" / "evaluate_mechanism.py"),
+                    "--per-run",
+                    str(report_dir / "per_run.csv"),
+                    "--output-dir",
+                    str(report_dir),
+                ],
+                cwd=project_root,
+                check=True,
+            )
+        elif args.suite == "oasd_v6":
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(project_root / "scripts" / "evaluate_oasd.py"),
                     "--per-run",
                     str(report_dir / "per_run.csv"),
                     "--output-dir",

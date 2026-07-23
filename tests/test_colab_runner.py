@@ -28,3 +28,7 @@ def test_recover_incomplete_archives_run_outside_experiment(tmp_path):
     assert archive_dir.name.endswith("__running")
     assert (archive_dir / "status.json").is_file()
     assert build_parser().parse_args(["--recover-incomplete"]).recover_incomplete
+
+
+def test_oasd_suite_is_available():
+    assert build_parser().parse_args(["--suite", "oasd_v6"]).suite == "oasd_v6"

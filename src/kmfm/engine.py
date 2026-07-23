@@ -14,10 +14,15 @@ import torch
 from scipy import stats
 from scipy.ndimage import distance_transform_edt
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from .artifacts import build_manifest, environment_snapshot, json_dump, save_confusion_csv
 from .data import HSIPatchDataset, load_hsi, standardize_cube
+from .distillation import (
+    advantage_weighted_distillation_loss,
+    class_advantage_profile,
+    stratified_folds,
+)
 from .metrics import classification_metrics, probabilistic_metrics, routing_diagnostics
 from .model import LASSFNet
 from .splits import TEST, TRAIN, VAL, load_split
@@ -88,6 +93,34 @@ def _model_name(config: dict[str, Any]) -> str:
     )
 
 
+def _build_model(
+    *,
+    bands: int,
+    num_classes: int,
+    model_cfg: dict[str, Any],
+    device: torch.device,
+) -> LASSFNet:
+    return LASSFNet(
+        bands=bands,
+        num_classes=num_classes,
+        hidden_dim=int(model_cfg.get("hidden_dim", 64)),
+        spectral=model_cfg.get("spectral", "conv1d"),
+        fusion=model_cfg.get("fusion", "reliability"),
+        dropout=float(model_cfg.get("dropout", 0.1)),
+        normalize_branches=bool(model_cfg.get("normalize_branches", False)),
+        entropy_temperature=float(model_cfg.get("entropy_temperature", 0.25)),
+    ).to(device)
+
+
+def _make_scaler(device: torch.device, enabled: bool) -> torch.amp.GradScaler | None:
+    if not enabled or device.type != "cuda":
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
 def resolve_run_dir(config: dict[str, Any]) -> Path:
     output_root = Path(config["output"]["root"])
     experiment = config["output"]["experiment"]
@@ -147,10 +180,13 @@ def _run_loader(
     scaler: torch.amp.GradScaler | None,
     aux_weight: float,
     amp_enabled: bool,
+    distillation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     training = optimizer is not None
     model.train(training)
     losses: list[float] = []
+    distillation_losses: list[float] = []
+    distillation_weights: list[float] = []
     targets_all: list[np.ndarray] = []
     predictions_all: list[np.ndarray] = []
     coords_all: list[np.ndarray] = []
@@ -187,6 +223,19 @@ def _run_loader(
                     criterion(output["spatial_logits"], target)
                     + criterion(output["spectral_logits"], target)
                 )
+                distillation_loss = torch.zeros((), device=device, dtype=loss.dtype)
+                mean_distillation_weight = torch.zeros((), device=device, dtype=loss.dtype)
+                if training and distillation is not None:
+                    distillation_loss, mean_distillation_weight = (
+                        advantage_weighted_distillation_loss(
+                            output["logits"],
+                            output["spectral_logits"],
+                            target,
+                            distillation["class_weights"],
+                            temperature=float(distillation["temperature"]),
+                        )
+                    )
+                    loss = loss + float(distillation["coefficient"]) * distillation_loss
             if training:
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -196,6 +245,8 @@ def _run_loader(
                     loss.backward()
                     optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            distillation_losses.append(float(distillation_loss.detach().cpu()))
+            distillation_weights.append(float(mean_distillation_weight.detach().cpu()))
             targets_all.append(target.detach().cpu().numpy())
             predictions_all.append(output["logits"].argmax(dim=-1).detach().cpu().numpy())
             coords_all.append(coords.numpy())
@@ -258,6 +309,8 @@ def _run_loader(
     )
     return {
         "loss": float(np.mean(losses)),
+        "distillation_loss": float(np.mean(distillation_losses)),
+        "distillation_weight": float(np.mean(distillation_weights)),
         "metrics": metrics,
         "confusion": confusion,
         "targets": targets,
@@ -279,6 +332,161 @@ def _run_loader(
         "spectral_contribution_norm": np.concatenate(spectral_contribution_norm_all),
         "contribution_ratio": np.concatenate(contribution_ratio_all),
     }
+
+
+def _subset_loader(
+    dataset: HSIPatchDataset,
+    indices: np.ndarray,
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed) if shuffle else None
+    return DataLoader(
+        Subset(dataset, indices.astype(np.int64).tolist()),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        generator=generator,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
+
+
+def _estimate_oof_advantage(
+    *,
+    train_dataset: HSIPatchDataset,
+    bands: int,
+    num_classes: int,
+    model_cfg: dict[str, Any],
+    training_cfg: dict[str, Any],
+    criterion: nn.Module,
+    device: torch.device,
+    seed: int,
+    distillation_cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any], float]:
+    targets = np.asarray(
+        [train_dataset.labels[row, col] - 1 for row, col in train_dataset.coords],
+        dtype=np.int64,
+    )
+    n_splits = int(distillation_cfg.get("folds", 3))
+    folds = stratified_folds(targets, n_splits=n_splits, seed=seed + 1701)
+    spatial_predictions = np.full(len(targets), -1, dtype=np.int64)
+    spectral_predictions = np.full(len(targets), -1, dtype=np.int64)
+    batch_size = int(training_cfg.get("batch_size", 64))
+    num_workers = int(training_cfg.get("num_workers", 0))
+    epochs = int(distillation_cfg.get("oof_epochs", 60))
+    if epochs < 1:
+        raise ValueError("distillation.oof_epochs must be positive")
+    amp_enabled = bool(training_cfg.get("amp", True)) and device.type == "cuda"
+    aux_weight = float(distillation_cfg.get("oof_aux_weight", 0.5))
+    fold_rows: list[dict[str, Any]] = []
+
+    _sync(device)
+    started = time.perf_counter()
+    all_indices = np.arange(len(targets), dtype=np.int64)
+    for fold_id, holdout_indices in enumerate(folds):
+        fold_seed = seed * 1009 + fold_id + 1
+        set_reproducibility(fold_seed, bool(training_cfg.get("deterministic", True)))
+        train_indices = np.setdiff1d(all_indices, holdout_indices, assume_unique=True)
+        fold_train_loader = _subset_loader(
+            train_dataset,
+            train_indices,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=True,
+            seed=fold_seed,
+        )
+        fold_holdout_loader = _subset_loader(
+            train_dataset,
+            holdout_indices,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=False,
+            seed=fold_seed,
+        )
+        fold_model_cfg = copy.deepcopy(model_cfg)
+        fold_model_cfg["fusion"] = "spatial_only"
+        fold_model = _build_model(
+            bands=bands,
+            num_classes=num_classes,
+            model_cfg=fold_model_cfg,
+            device=device,
+        )
+        optimizer = torch.optim.AdamW(
+            fold_model.parameters(),
+            lr=float(training_cfg.get("lr", 3e-4)),
+            weight_decay=float(training_cfg.get("weight_decay", 1e-4)),
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(epochs, 1)
+        )
+        scaler = _make_scaler(device, amp_enabled)
+        for _ in range(epochs):
+            _run_loader(
+                fold_model,
+                fold_train_loader,
+                device,
+                num_classes,
+                criterion,
+                optimizer,
+                scaler,
+                aux_weight,
+                amp_enabled,
+            )
+            scheduler.step()
+        holdout = _run_loader(
+            fold_model,
+            fold_holdout_loader,
+            device,
+            num_classes,
+            criterion,
+            None,
+            None,
+            aux_weight,
+            amp_enabled,
+        )
+        spatial_predictions[holdout_indices] = holdout["predictions"]
+        spectral_predictions[holdout_indices] = holdout["spectral_predictions"]
+        fold_rows.append(
+            {
+                "fold": fold_id,
+                "train_count": int(len(train_indices)),
+                "holdout_count": int(len(holdout_indices)),
+                "spatial_oa": float(np.mean(holdout["predictions"] == holdout["targets"])),
+                "spectral_oa": float(
+                    np.mean(holdout["spectral_predictions"] == holdout["targets"])
+                ),
+            }
+        )
+        del fold_model, optimizer, scheduler, scaler
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    _sync(device)
+    elapsed = time.perf_counter() - started
+    if np.any(spatial_predictions < 0) or np.any(spectral_predictions < 0):
+        raise RuntimeError("OOF prediction arrays were not filled completely")
+    profile = class_advantage_profile(
+        targets,
+        spatial_predictions,
+        spectral_predictions,
+        num_classes,
+        prior_strength=float(distillation_cfg.get("prior_strength", 4.0)),
+        reference_gain=float(distillation_cfg.get("reference_gain", 0.25)),
+    )
+    payload = {
+        "mode": "oof_class",
+        "folds": n_splits,
+        "oof_epochs": epochs,
+        "oof_aux_weight": aux_weight,
+        "prior_strength": float(distillation_cfg.get("prior_strength", 4.0)),
+        "reference_gain": float(distillation_cfg.get("reference_gain", 0.25)),
+        "fold_results": fold_rows,
+        **profile.to_dict(),
+    }
+    return profile.class_weights, payload, elapsed
 
 
 def _write_curves(path: Path, curves: list[dict[str, Any]]) -> None:
@@ -352,19 +560,75 @@ def run_experiment(config: dict[str, Any]) -> Path:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_cfg = config["model"]
-        model = LASSFNet(
-            bands=cube.shape[-1],
-            num_classes=hsi.num_classes,
-            hidden_dim=int(model_cfg.get("hidden_dim", 64)),
-            spectral=model_cfg.get("spectral", "conv1d"),
-            fusion=model_cfg.get("fusion", "reliability"),
-            dropout=float(model_cfg.get("dropout", 0.1)),
-            normalize_branches=bool(model_cfg.get("normalize_branches", False)),
-            entropy_temperature=float(model_cfg.get("entropy_temperature", 0.25)),
-        ).to(device)
-        parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
         criterion = nn.CrossEntropyLoss()
         training_cfg = config["training"]
+        distillation_cfg = copy.deepcopy(model_cfg.get("distillation", {"mode": "none"}))
+        distillation_mode = str(distillation_cfg.get("mode", "none"))
+        if distillation_mode not in {"none", "uniform", "oof_class"}:
+            raise ValueError(
+                "model.distillation.mode must be one of none, uniform or oof_class"
+            )
+        oof_training_seconds = 0.0
+        if distillation_mode == "oof_class":
+            if not isinstance(train_loader.dataset, HSIPatchDataset):
+                raise TypeError("OOF distillation requires an HSIPatchDataset training set")
+            class_weights, distillation_profile, oof_training_seconds = (
+                _estimate_oof_advantage(
+                    train_dataset=train_loader.dataset,
+                    bands=cube.shape[-1],
+                    num_classes=hsi.num_classes,
+                    model_cfg=model_cfg,
+                    training_cfg=training_cfg,
+                    criterion=criterion,
+                    device=device,
+                    seed=seed,
+                    distillation_cfg=distillation_cfg,
+                )
+            )
+        elif distillation_mode == "uniform":
+            class_weights = np.ones(hsi.num_classes, dtype=np.float32)
+            distillation_profile = {
+                "mode": "uniform",
+                "class_weights": class_weights.astype(float).tolist(),
+                "per_class": [],
+                "spatial_oa": None,
+                "spectral_oa": None,
+            }
+        else:
+            class_weights = np.zeros(hsi.num_classes, dtype=np.float32)
+            distillation_profile = {
+                "mode": "none",
+                "class_weights": class_weights.astype(float).tolist(),
+                "per_class": [],
+                "spatial_oa": None,
+                "spectral_oa": None,
+            }
+        coefficient = float(distillation_cfg.get("coefficient", 0.5))
+        temperature = float(distillation_cfg.get("temperature", 2.0))
+        if coefficient < 0:
+            raise ValueError("model.distillation.coefficient must be non-negative")
+        if temperature <= 0:
+            raise ValueError("model.distillation.temperature must be positive")
+        distillation_profile.update(
+            {
+                "coefficient": coefficient,
+                "temperature": temperature,
+                "active_class_count": int(np.sum(class_weights > 0.0)),
+                "oof_training_seconds": oof_training_seconds,
+            }
+        )
+        json_dump(run_dir / "distillation_profile.json", distillation_profile)
+
+        # Cross-fitting consumes random state. Reset before final training so all
+        # v6 variants start from the same seed-specific initialization.
+        set_reproducibility(seed, bool(training_cfg.get("deterministic", True)))
+        model = _build_model(
+            bands=cube.shape[-1],
+            num_classes=hsi.num_classes,
+            model_cfg=model_cfg,
+            device=device,
+        )
+        parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=float(training_cfg.get("lr", 3e-4)),
@@ -373,15 +637,20 @@ def run_experiment(config: dict[str, Any]) -> Path:
         epochs = int(training_cfg.get("epochs", 200))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
         amp_enabled = bool(training_cfg.get("amp", True)) and device.type == "cuda"
-        if amp_enabled:
-            try:
-                scaler = torch.amp.GradScaler("cuda", enabled=True)
-            except (AttributeError, TypeError):
-                scaler = torch.cuda.amp.GradScaler(enabled=True)
-        else:
-            scaler = None
+        scaler = _make_scaler(device, amp_enabled)
         aux_weight = float(training_cfg.get("aux_weight", 0.2))
         patience = int(training_cfg.get("patience", 30))
+        distillation_context = (
+            {
+                "class_weights": torch.as_tensor(
+                    class_weights, dtype=torch.float32, device=device
+                ),
+                "coefficient": coefficient,
+                "temperature": temperature,
+            }
+            if distillation_mode != "none" and coefficient > 0
+            else None
+        )
 
         best_oa = -float("inf")
         best_epoch = -1
@@ -400,6 +669,7 @@ def run_experiment(config: dict[str, Any]) -> Path:
                 scaler,
                 aux_weight,
                 amp_enabled,
+                distillation_context,
             )
             val_result = _run_loader(
                 model,
@@ -420,6 +690,8 @@ def run_experiment(config: dict[str, Any]) -> Path:
                     "lr": optimizer.param_groups[0]["lr"],
                     "train_loss": train_result["loss"],
                     "train_oa": train_result["metrics"]["oa"],
+                    "train_distillation_loss": train_result["distillation_loss"],
+                    "train_distillation_weight": train_result["distillation_weight"],
                     "val_loss": val_result["loss"],
                     "val_oa": val_oa,
                     "val_aa": val_result["metrics"]["aa"],
@@ -614,7 +886,17 @@ def run_experiment(config: dict[str, Any]) -> Path:
             "epochs_completed": len(curves),
             "parameter_count": parameter_count,
             "training_seconds": training_seconds,
+            "oof_training_seconds": oof_training_seconds,
+            "total_training_seconds": training_seconds + oof_training_seconds,
             "test_inference_seconds": test_seconds,
+            "distillation_mode": distillation_mode,
+            "distillation_coefficient": coefficient,
+            "distillation_temperature": temperature,
+            "distillation_active_class_count": int(np.sum(class_weights > 0.0)),
+            "distillation_class_weight_mean": float(class_weights.mean()),
+            "distillation_class_weight_max": float(class_weights.max()),
+            "distillation_oof_spatial_oa": distillation_profile.get("spatial_oa"),
+            "distillation_oof_spectral_oa": distillation_profile.get("spectral_oa"),
             "gate_mean": gate_mean,
             "gate_std": gate_std,
             "spatial_feature_norm_mean": spatial_feature_norm_mean,

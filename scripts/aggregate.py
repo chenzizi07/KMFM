@@ -56,6 +56,15 @@ DIAGNOSTIC_FIELDS = (
     "validation_oof_neutral_count",
     "validation_oof_net_corrected",
     "validation_oof_wilson_lower",
+    "oof_training_seconds",
+    "total_training_seconds",
+    "distillation_coefficient",
+    "distillation_temperature",
+    "distillation_active_class_count",
+    "distillation_class_weight_mean",
+    "distillation_class_weight_max",
+    "distillation_oof_spatial_oa",
+    "distillation_oof_spectral_oa",
 )
 PAIRED_METRICS = PRIMARY_METRICS + PROBABILISTIC_METRICS
 
