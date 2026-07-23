@@ -100,6 +100,19 @@ bash scripts/colab_update.sh
 7. 检查 run artifact 和 `verify_run.py`；
 8. 再运行正式 seeds 和消融。
 
+如果继续使用原来的 Colab notebook，可把它当作启动界面，不再复制旧训练逻辑。更新仓库和安装后，直接运行推荐 pilot：
+
+```bash
+%cd /content/drive/MyDrive/Colab/Unsupervised/KMFM
+!bash scripts/colab_update.sh
+!python scripts/run_colab_experiment.py \
+  --dataset pavia_university \
+  --experiment pilot_v1 \
+  --seeds 0,1 --epochs 50 --patience 15
+```
+
+完成后将 `--dataset` 改为 `ksc`，保持相同 `--experiment pilot_v1`。启动器会跳过已经成功且不可变的 run，适合 Colab 中断后重新执行；遇到失败或不完整的 run 时不会覆盖，而会要求检查 `status.json` 并使用新的实验批次名。
+
 推荐 Colab GPU：T4/L4/A100。默认实现不依赖 `mamba-ssm` CUDA 扩展，普通 Colab PyTorch 即可运行。
 
 ## 4. 命令行示例
